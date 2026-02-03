@@ -1,0 +1,114 @@
+name: CD Workflow - Deploy to Azure Container Apps
+
+on:
+  workflow_run:
+    workflows: ["CI Workflow"]
+    types:
+      - completed
+    branches:
+      - main
+      - master
+
+env:
+  IMAGE_NAME: doffin-documents-mcp
+
+jobs:
+  deploy_test:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ACR_NAME: crdoffintest
+      RESOURCE_GROUP: rg-doffin-ai-test
+      CONTAINER_APP: aca-doffin-documents-mcp-test
+    steps:
+    - name: Azure Login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Get image tag from CI workflow
+      id: get-tag
+      run: |
+        SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+        echo "tag=$SHA" >> $GITHUB_OUTPUT
+
+    - name: Deploy to Container App (TEST)
+      run: |
+        IMAGE="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag }}"
+        echo "Deploying image: $IMAGE"
+        az containerapp update \
+          --name "${{ env.CONTAINER_APP }}" \
+          --resource-group "${{ env.RESOURCE_GROUP }}" \
+          --image "$IMAGE"
+
+    - name: Verify Deployment
+      run: |
+        az containerapp show \
+          --name "${{ env.CONTAINER_APP }}" \
+          --resource-group "${{ env.RESOURCE_GROUP }}" \
+          --query '{name: name, status: properties.provisioningState, image: properties.template.containers[0].image}' \
+          -o json
+
+    - name: Azure Logout
+      run: az logout
+
+  deploy_prod:
+    if: github.event.workflow_run.conclusion == 'success'
+    needs: deploy_test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ACR_NAME: crdoffin
+      RESOURCE_GROUP: rg-doffin-ai
+      CONTAINER_APP: aca-doffin-documents-mcp
+    steps:
+    - name: Azure Login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Get image tag from CI workflow
+      id: get-tag
+      run: |
+        SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
+        echo "tag=$SHA" >> $GITHUB_OUTPUT
+
+    - name: Login to ACR (Prod)
+      run: az acr login --name ${{ env.ACR_NAME }}
+
+    - name: Copy image from Test ACR to Prod ACR
+      run: |
+        az acr import \
+          --name ${{ env.ACR_NAME }} \
+          --source crdoffintest.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag }} \
+          --image ${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag }} \
+          --force
+
+    - name: Deploy to Container App (PROD)
+      run: |
+        IMAGE="${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag }}"
+        echo "Deploying image: $IMAGE"
+        az containerapp update \
+          --name "${{ env.CONTAINER_APP }}" \
+          --resource-group "${{ env.RESOURCE_GROUP }}" \
+          --image "$IMAGE"
+
+    - name: Verify Deployment
+      run: |
+        az containerapp show \
+          --name "${{ env.CONTAINER_APP }}" \
+          --resource-group "${{ env.RESOURCE_GROUP }}" \
+          --query '{name: name, status: properties.provisioningState, image: properties.template.containers[0].image}' \
+          -o json
+
+    - name: Azure Logout
+      run: az logout

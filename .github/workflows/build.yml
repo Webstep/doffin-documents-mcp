@@ -1,0 +1,97 @@
+name: CI Workflow
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  IMAGE_NAME: doffin-documents-mcp
+  ACR_NAME_TEST: crdoffintest
+  ACR_NAME_PROD: crdoffin
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+    - name: Build and test with Gradle
+      run: ./gradlew clean build bootJar --no-daemon
+    - name: Upload JAR artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: app-jar
+        path: build/libs/*.jar
+        retention-days: 1
+
+  package_and_push:
+    needs: build_and_test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+    outputs:
+      image-tag: ${{ steps.tags.outputs.tag }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Download app JAR
+      uses: actions/download-artifact@v4
+      with:
+        name: app-jar
+        path: build/libs/
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Define Docker Tags
+      id: tags
+      run: |
+        SHA=${GITHUB_SHA::7}
+        echo "tag=$SHA" >> $GITHUB_OUTPUT
+
+    - name: Azure Login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to ACR (Test)
+      run: az acr login --name ${{ env.ACR_NAME_TEST }}
+
+    - name: Build and push Docker image (Test)
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ env.ACR_NAME_TEST }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}
+          ${{ env.ACR_NAME_TEST }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Run Trivy vulnerability scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: '${{ env.ACR_NAME_TEST }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'HIGH,CRITICAL'
+        ignore-unfixed: true
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v4
+      continue-on-error: true  # Don't fail build if Advanced Security is unavailable
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+    - name: Azure Logout
+      run: az logout
